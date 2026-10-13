@@ -1,0 +1,18 @@
+name: Feature Request
+description: Suggest a failure to catch, or a change to how it's caught
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What failure is missed, or what's wrong with how it's flagged?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+    validations:
+      required: false

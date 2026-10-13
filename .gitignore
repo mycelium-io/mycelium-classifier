@@ -1,0 +1,29 @@
+# Room data and labels never go in git (mycelium#1288).
+raw/
+redacted/
+data/
+labels/
+eval/
+*.jsonl
+state.json
+stats.json
+*.log
+
+# Model weights and caches
+models/
+*.safetensors
+*.bin
+*.onnx
+*.pt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+.DS_Store
+.env

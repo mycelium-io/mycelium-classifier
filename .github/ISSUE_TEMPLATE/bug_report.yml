@@ -1,0 +1,30 @@
+name: Bug Report
+description: Report a bug in mycelium-classifier
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please don't paste room transcripts or labels here. Describe the message in your own words, or make up an example.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What went wrong?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
