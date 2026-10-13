@@ -128,7 +128,7 @@ def read_transcript(
     if not path.exists():
         had_lines = cursor is not None and cursor.get("lines", 0) > 0
         return [], {"lines": 0, "last_id": None}, cursor is None or had_lines
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         lines = [line for line in fh if line.strip()]
     start = 0
     if (
@@ -347,7 +347,7 @@ def stats(room: str, records: list[dict[str, Any]], rows: list[dict[str, Any]]) 
 
 def write_jsonl(path: Path, items: list[dict[str, Any]], *, append: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a" if append else "w") as fh:
+    with path.open("a" if append else "w", encoding="utf-8") as fh:
         for item in items:
             fh.write(json.dumps(item, ensure_ascii=False) + "\n")
 
@@ -355,13 +355,13 @@ def write_jsonl(path: Path, items: list[dict[str, Any]], *, append: bool = False
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
 
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2))
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ── A run ───────────────────────────────────────────────────────────────────
@@ -391,7 +391,7 @@ def harvest_room(
 def run(settings: Settings) -> dict[str, Any]:
     out = settings.data
     state_path = out / "state.json"
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
     cursors = state.setdefault("cursors", {})
     all_stats = []
     for room in [r["name"] for r in api(settings, "/rooms")]:

@@ -124,7 +124,7 @@ def test_candidate_counts_follow_the_rules() -> None:
 def _write_transcript(hub_data: Path, records: list[dict[str, Any]]) -> None:
     path = hub_data / "rooms" / ROOM / "log" / "transcript.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
 
 
 def _settings(tmp_path: Path) -> harvest.Settings:
@@ -185,6 +185,23 @@ def test_a_run_writes_raw_redacted_stats_and_a_tally(
     tally = harvest.read_jsonl(data / "tally.jsonl")
     assert [t["agent_messages"] for t in tally] == [1, 1]
     assert tally[-1]["candidates"]["C2_done_fixed_green"] == 1
+
+
+def test_files_are_utf8_whatever_the_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(harvest, "api", _fake_api)
+    monkeypatch.setattr(harvest, "prs", lambda _s: [])
+    path = settings.hub_data / "rooms" / ROOM / "log" / "transcript.jsonl"
+    path.parent.mkdir(parents=True)
+    line = json.dumps(_rec(0, "builder", "ship it 🚀, Zoë, 東京"), ensure_ascii=False)
+    path.write_text(line + "\n", encoding="utf-8")
+
+    harvest.run(settings)
+
+    raw = (settings.data / "raw" / f"{ROOM}.jsonl").read_bytes()
+    assert "ship it 🚀, Zoë, 東京".encode() in raw
 
 
 def test_settings_default_to_the_data_folder_outside_the_repo(
