@@ -278,7 +278,15 @@ def harvest_room(settings: Settings, room: str) -> dict[str, Any]:
 
 def run(settings: Settings) -> dict[str, Any]:
     out = settings.data
-    all_stats = [harvest_room(settings, room) for room in rooms(settings)]
+    all_stats, failed = [], {}
+    for room in rooms(settings):
+        try:
+            all_stats.append(harvest_room(settings, room))
+        except RuntimeError as exc:
+            # One room that can't be exported (deleted, or a hub hiccup) shouldn't
+            # stop the rest of a scheduled run.
+            failed[room] = str(exc)
+            print(f"{room}: skipped, {exc}", file=sys.stderr)
     pulls = prs(settings)
     write_json(out / "raw" / "prs.json", pulls)
     write_json(out / "redacted" / "prs.json", redact(pulls))
@@ -288,6 +296,7 @@ def run(settings: Settings) -> dict[str, Any]:
         "at": now,
         "new_records": sum(s.get("new_records", 0) for s in all_stats),
         "rooms": all_stats,
+        "failed": failed,
         "prs": len(pulls),
     }
     write_json(out / "stats.json", summary)

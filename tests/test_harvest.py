@@ -166,6 +166,29 @@ def test_a_run_exports_twice_and_writes_raw_redacted_stats_and_a_tally(
     assert tally[-1]["candidates"]["C2_done_fixed_green"] == 2
 
 
+def test_a_room_that_fails_to_export_doesnt_stop_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    cli = FakeCli([_line(0, "builder", "done")])
+
+    def two_rooms(settings: harvest.Settings, *args: str) -> Any:
+        if args[:2] == ("room", "ls"):
+            return [{"name": "gone"}, {"name": ROOM}]
+        if args[2] == "gone":
+            raise RuntimeError("mycelium room export gone failed: Room not found")
+        return cli(settings, *args)
+
+    monkeypatch.setattr(harvest, "mycelium", two_rooms)
+    monkeypatch.setattr(harvest, "prs", lambda _s: [])
+
+    summary = harvest.run(settings)
+
+    assert list(summary["failed"]) == ["gone"]
+    assert [s["room"] for s in summary["rooms"]] == [ROOM]
+    assert (settings.data / "raw" / f"{ROOM}.jsonl").exists()
+
+
 def test_files_are_utf8_whatever_the_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
