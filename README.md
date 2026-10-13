@@ -52,6 +52,30 @@ If fewer than two classes are worth training, the spike ends there, and that is 
 
 This repository holds the code and the documentation only.
 
+## Running the harvest
+
+The harvest collects a hub's room histories into a dataset to label. Run it on the hub's machine, with Python 3.12 and nothing else to install:
+
+```bash
+PYTHONPATH=src python3 -m mycelium_classifier.harvest
+```
+
+It reads each room's message history from the hub's data folder (`~/.mycelium` by default), and the rooms' tasks and members from the hub's API. It also reads the pull requests of the repository the rooms work on, with `gh`. It writes into `~/Documents/mycelium-classifier`, outside this repository:
+
+| | |
+|---|---|
+| `raw/<room>.jsonl` | one line per message: who sent it and whether they are a person, an agent, an engine or the system; the task thread it is in; its type; its mentions; its text |
+| `raw/board-<room>.json` | every task, with its status, who it is for and who holds it |
+| `raw/prs.json` | pull request state and reviews |
+| `redacted/` | the same, with emails, tokens, links other than GitHub's and home-folder names replaced |
+| `stats.json` | counts per room, and how many messages each rough rule would put in front of a labeler |
+| `tally.jsonl` | one line per run, to see how fast each class grows |
+| `state.json` | where each room's last run stopped, so the next run reads only what is new |
+
+Options: `--data` (or `MYCELIUM_CLASSIFIER_DATA`) for where the dataset goes, `--hub` (or `MYCELIUM_API_URL`) for the hub's address, `--hub-data` (or `MYCELIUM_DATA_DIR`) for the hub's data folder, and `--repo` for the repository whose pull requests to read.
+
+Once `mycelium room export` ([mycelium#1292](https://github.com/mycelium-io/mycelium/pull/1292)) is released, the harvest will read rooms through it instead, and will work from any machine that can reach the hub.
+
 ## Status
 
 Early. Progress is reported on [mycelium#1288](https://github.com/mycelium-io/mycelium/issues/1288).
