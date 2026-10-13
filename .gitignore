@@ -1,16 +1,18 @@
 # Room data and labels never go in git (mycelium#1288).
-raw/
-redacted/
-data/
-labels/
-eval/
+# Anchored to the top of the repo, so a code folder like
+# src/mycelium_classifier/eval/ is still tracked.
+/raw/
+/redacted/
+/data/
+/labels/
+/eval/
 *.jsonl
 state.json
 stats.json
 *.log
 
 # Model weights and caches
-models/
+/models/
 *.safetensors
 *.bin
 *.onnx
