@@ -1,4 +1,8 @@
-"""Tests for the harvest, on made-up rooms only. No room data belongs in this repository."""
+"""Tests for the harvest, on made-up rooms only. No room data belongs in this repository.
+
+The ``mycelium`` CLI is replaced by a fake that writes export folders the way
+``mycelium room export`` does, so these run without a hub.
+"""
 
 from __future__ import annotations
 
@@ -15,80 +19,84 @@ ROOM = "demo"
 T0 = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 
 
-def _rec(
+def _line(
     n: int,
     sender: str,
-    text: str | None = None,
+    text: str,
     *,
-    ptype: str = "message",
-    episode: str = "live",
-    role: str = "agent",
-    data: dict[str, Any] | None = None,
+    kind: str = "agent",
+    type_: str = "message",
+    thread: str | None = None,
     minutes: int | None = None,
+    mentions: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    content: dict[str, Any] = {
-        "l9": {
-            "header": {
-                "message": {
-                    "episode": f"urn:ioc:mycelium:episode:{ROOM}:{episode}",
-                    "id": f"m{n}",
-                    "parents": [],
-                },
-                "participants": {"actors": [{"id": sender, "role": role}]},
-            },
-            "payload": {"type": ptype, "data": data or {}},
-        }
-    }
-    if text is not None:
-        content["content"] = text
+    """One line as ``room export`` writes it."""
     return {
-        "content": content,
-        "kind": "exchange",
-        "message_id": f"m{n}",
-        "recorded_at": (T0 + timedelta(minutes=n if minutes is None else minutes)).isoformat(),
+        "id": f"m{n}",
+        "at": (T0 + timedelta(minutes=n if minutes is None else minutes)).isoformat(),
         "sender": sender,
-        "subkind": None,
+        "sender_kind": kind,
+        "type": type_,
+        "notice": None,
+        "channel": "thread" if thread else "live",
+        "thread": thread,
+        "task": "work/fix-login" if thread else None,
+        "refers_to_thread": None,
+        "refers_to_task": None,
+        "parents": [],
+        "mentions": mentions or [],
+        "text": text,
+        "data": {},
     }
 
 
-KINDS = {"ada": "person", "builder": "agent", "checker": "agent", "system": "system"}
-TASKS = {"t1": "work/fix-login"}
+class FakeCli:
+    """Stands in for ``mycelium``: ``room ls`` and ``room export`` into a folder."""
+
+    def __init__(self, lines: list[dict[str, Any]], board: list[dict[str, Any]] | None = None):
+        self.lines = lines
+        self.board = board or [{"key": "work/fix-login", "title": "Fix login", "thread": "t1"}]
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, settings: harvest.Settings, *args: str) -> Any:
+        del settings
+        self.calls.append(args)
+        if args[:2] == ("room", "ls"):
+            return [{"name": ROOM}]
+        out = Path(args[args.index("--out") + 1])
+        redacted = "--redact" in args
+        out.mkdir(parents=True, exist_ok=True)
+        cursor = out / "cursor.json"
+        written = json.loads(cursor.read_text())["total"] if cursor.exists() else 0
+        new = self.lines[written:]
+        with (out / "messages.jsonl").open("a", encoding="utf-8") as fh:
+            for line in new:
+                if redacted:
+                    line = {**line, "text": harvest.redact_text(line["text"])}
+                fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+        (out / "board.json").write_text(json.dumps(self.board), encoding="utf-8")
+        cursor.write_text(json.dumps({"total": len(self.lines)}), encoding="utf-8")
+        return {
+            "room": ROOM,
+            "new": len(new),
+            "total": len(self.lines),
+            "board_rows": len(self.board),
+            "from_start": written == 0,
+        }
 
 
-def test_a_record_says_who_where_and_what() -> None:
-    ask = harvest.normalize(
-        ROOM, _rec(0, "ada", "@builder go @~checker fyi @!builder now", role="human"), KINDS, TASKS
-    )
-    reply = harvest.normalize(ROOM, _rec(1, "builder", "on it", episode="t1"), KINDS, TASKS)
-    notice = harvest.normalize(
-        ROOM,
-        _rec(
-            2,
-            "system",
-            ptype="notice",
-            role="coordinator",
-            data={
-                "subkind": "resolved",
-                "title": "Fix login",
-                "by": "builder",
-                "episode": f"urn:ioc:mycelium:episode:{ROOM}:t1",
-            },
-        ),
-        KINDS,
-        TASKS,
-    )
-    engine = harvest.normalize(ROOM, _rec(3, "aligner", "round one", role="coordinator"), KINDS, {})
+def _settings(tmp_path: Path) -> harvest.Settings:
+    return harvest.Settings(data=tmp_path / "data", hub=None, repo="o/r")
 
-    assert (ask["sender_kind"], ask["channel"], ask["labelable"]) == ("person", "live", False)
-    assert [m["mode"] for m in ask["mentions"]] == ["plain", "silent", "urgent"]
-    assert (reply["thread"], reply["task"], reply["labelable"]) == ("t1", "work/fix-login", True)
-    assert notice["text"] == "[resolved] Fix login by @builder"
-    assert (notice["notice"], notice["refers_to_task"], notice["labelable"]) == (
-        "resolved",
-        "work/fix-login",
-        False,
-    )
-    assert engine["sender_kind"] == "engine"
+
+def test_an_export_line_gains_its_room_and_whether_to_label_it() -> None:
+    agent = harvest.with_room(ROOM, _line(0, "builder", "done"))
+    person = harvest.with_room(ROOM, _line(1, "ada", "thanks", kind="person"))
+    notice = harvest.with_room(ROOM, _line(2, "system", "[filed] x", kind="system", type_="notice"))
+
+    assert (agent["room"], agent["labelable"]) == (ROOM, True)
+    assert person["labelable"] is False
+    assert notice["labelable"] is False
 
 
 def test_redact_replaces_secrets_and_keeps_github() -> None:
@@ -103,16 +111,23 @@ def test_redact_replaces_secrets_and_keeps_github() -> None:
 
 
 def test_candidate_counts_follow_the_rules() -> None:
-    records = [
-        harvest.normalize(ROOM, r, KINDS, TASKS)
-        for r in [
-            _rec(0, "ada", "@builder can you look? @checker too", role="human", minutes=0),
-            _rec(1, "builder", "Done, and it's approved", minutes=5),
-            _rec(2, "checker", "I decided to keep the old flag", minutes=60),
-            _rec(3, "builder", "nothing to see", minutes=70),
-        ]
+    lines = [
+        _line(
+            0,
+            "ada",
+            "@builder can you look? @checker too",
+            kind="person",
+            minutes=0,
+            mentions=[
+                {"handle": "builder", "mode": "plain"},
+                {"handle": "checker", "mode": "plain"},
+            ],
+        ),
+        _line(1, "builder", "Done, and it's approved", minutes=5),
+        _line(2, "checker", "I decided to keep the old flag", minutes=60),
+        _line(3, "builder", "nothing to see", minutes=70),
     ]
-    counts = harvest.candidates(records)
+    counts = harvest.candidates([harvest.with_room(ROOM, x) for x in lines])
 
     assert counts["C1_approved_or_ready_to_merge"] == 1
     assert counts["C2_done_fixed_green"] == 1
@@ -121,82 +136,67 @@ def test_candidate_counts_follow_the_rules() -> None:
     assert (counts["C4_agent_mentions"], counts["C4_unanswered_30m"]) == (2, 1)
 
 
-def _write_transcript(hub_data: Path, records: list[dict[str, Any]]) -> None:
-    path = hub_data / "rooms" / ROOM / "log" / "transcript.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
-
-
-def _settings(tmp_path: Path) -> harvest.Settings:
-    return harvest.Settings(
-        data=tmp_path / "data", hub="http://hub", hub_data=tmp_path / "hub", repo="o/r"
-    )
-
-
-def test_the_cursor_reads_only_what_is_new(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    records = [_rec(n, "builder", f"msg {n}") for n in range(3)]
-    _write_transcript(settings.hub_data, records)
-
-    fresh, cursor, from_start = harvest.read_transcript(settings, ROOM, None)
-    assert (len(fresh), cursor["lines"], from_start) == (3, 3, True)
-
-    _write_transcript(settings.hub_data, [*records, _rec(3, "builder", "msg 3")])
-    fresh, cursor, from_start = harvest.read_transcript(settings, ROOM, cursor)
-    assert ([r["message_id"] for r in fresh], from_start) == (["m3"], False)
-
-    _write_transcript(settings.hub_data, [_rec(9, "builder", "rewritten")])
-    fresh, _, from_start = harvest.read_transcript(settings, ROOM, cursor)
-    assert ([r["message_id"] for r in fresh], from_start) == (["m9"], True)
-
-
-def _fake_api(settings: harvest.Settings, path: str, **_params: Any) -> Any:
-    del settings
-    if path == "/rooms":
-        return [{"name": ROOM}]
-    if path.endswith("/agents"):
-        return [{"handle": "builder"}, {"handle": "checker"}]
-    if path == "/users":
-        return {"users": [{"handle": "ada"}]}
-    return []
-
-
-def test_a_run_writes_raw_redacted_stats_and_a_tally(
+def test_a_run_exports_twice_and_writes_raw_redacted_stats_and_a_tally(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings(tmp_path)
-    monkeypatch.setattr(harvest, "api", _fake_api)
-    monkeypatch.setattr(harvest, "prs", lambda _s: [])
-    _write_transcript(
-        settings.hub_data,
-        [_rec(0, "ada", "@builder hi a@b.co", role="human"), _rec(1, "builder", "done")],
+    cli = FakeCli(
+        [_line(0, "ada", "@builder hi a@b.co", kind="person"), _line(1, "builder", "done")]
     )
+    monkeypatch.setattr(harvest, "mycelium", cli)
+    monkeypatch.setattr(harvest, "prs", lambda _s: [])
 
     first = harvest.run(settings)
+    cli.lines.append(_line(2, "builder", "fixed it", thread="t1"))
     second = harvest.run(settings)
 
+    exports = [c for c in cli.calls if c[:2] == ("room", "export")]
+    assert sum("--redact" in c for c in exports) == len(exports) // 2
     data = settings.data
     raw = harvest.read_jsonl(data / "raw" / f"{ROOM}.jsonl")
     redacted = harvest.read_jsonl(data / "redacted" / f"{ROOM}.jsonl")
-    assert [r["sender_kind"] for r in raw] == ["person", "agent"]
+    assert [r["id"] for r in raw] == ["m0", "m1", "m2"]
+    assert [r["labelable"] for r in raw] == [False, True, True]
     assert "a@b.co" in raw[0]["text"]
     assert "<EMAIL>" in redacted[0]["text"]
-    assert (first["new_records"], second["new_records"]) == (2, 0)
+    assert (data / "raw" / f"board-{ROOM}.json").exists()
+    assert (first["new_records"], second["new_records"]) == (2, 1)
     tally = harvest.read_jsonl(data / "tally.jsonl")
-    assert [t["agent_messages"] for t in tally] == [1, 1]
-    assert tally[-1]["candidates"]["C2_done_fixed_green"] == 1
+    assert [t["new_agent_messages"] for t in tally] == [1, 1]
+    assert tally[-1]["candidates"]["C2_done_fixed_green"] == 2
+
+
+def test_a_room_that_fails_to_export_doesnt_stop_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    cli = FakeCli([_line(0, "builder", "done")])
+
+    def two_rooms(settings: harvest.Settings, *args: str) -> Any:
+        if args[:2] == ("room", "ls"):
+            return [{"name": "gone"}, {"name": ROOM}]
+        if args[2] == "gone":
+            raise RuntimeError("mycelium room export gone failed: Room not found")
+        return cli(settings, *args)
+
+    monkeypatch.setattr(harvest, "mycelium", two_rooms)
+    monkeypatch.setattr(harvest, "prs", lambda _s: [])
+
+    summary = harvest.run(settings)
+
+    assert list(summary["failed"]) == ["gone"]
+    assert [s["room"] for s in summary["rooms"]] == [ROOM]
+    assert (settings.data / "raw" / f"{ROOM}.jsonl").exists()
 
 
 def test_files_are_utf8_whatever_the_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings(tmp_path)
-    monkeypatch.setattr(harvest, "api", _fake_api)
+    monkeypatch.setattr(
+        harvest, "mycelium", FakeCli([_line(0, "builder", "ship it 🚀, Zoë, 東京")])
+    )
     monkeypatch.setattr(harvest, "prs", lambda _s: [])
-    path = settings.hub_data / "rooms" / ROOM / "log" / "transcript.jsonl"
-    path.parent.mkdir(parents=True)
-    line = json.dumps(_rec(0, "builder", "ship it 🚀, Zoë, 東京"), ensure_ascii=False)
-    path.write_text(line + "\n", encoding="utf-8")
 
     harvest.run(settings)
 
@@ -209,7 +209,7 @@ def test_settings_default_to_the_data_folder_outside_the_repo(
 ) -> None:
     monkeypatch.delenv("MYCELIUM_CLASSIFIER_DATA", raising=False)
     settings = harvest.settings_from([])
-    assert settings.data == Path.home() / "Documents/mycelium-classifier"
+    assert (settings.data, settings.hub) == (Path.home() / "Documents/mycelium-classifier", None)
 
     settings = harvest.settings_from(["--data", "/tmp/elsewhere", "--hub", "http://h:1/"])  # noqa: S108
     assert (settings.data, settings.hub) == (Path("/tmp/elsewhere"), "http://h:1")  # noqa: S108

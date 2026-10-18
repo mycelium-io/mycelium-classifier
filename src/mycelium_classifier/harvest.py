@@ -1,22 +1,25 @@
 """Collect a hub's room histories into a local dataset for labeling.
 
-Reads every room on the hub: each room's transcript (``log/transcript.jsonl`` in
-the hub's data folder, read-only), its board rows and its members (over the
-hub's API), and the pull requests of the repository the rooms work on (``gh``,
-read-only). Writes, into the data folder:
+For every room on the hub, runs ``mycelium room export`` twice: as written, and
+with ``--redact``. Each export folder keeps its own cursor, so a run fetches only
+what is new. Also reads the pull requests of the repository the rooms work on
+(``gh``, read-only). Writes, into the data folder:
 
-    raw/<room>.jsonl         one record per message, notices and pings included
-    raw/board-<room>.json    every board row (work/, decisions/, status/, failed/)
+    exports/<room>/          the export as written (messages.jsonl, board.json, cursor.json)
+    exports-redacted/<room>/ the same with emails, tokens, links other than GitHub's
+                             and home-folder names replaced
+    raw/<room>.jsonl         the export's messages, each with its room and whether
+                             it is an agent's message to label (``labelable``)
+    raw/board-<room>.json    the room's board rows
     raw/prs.json             pull request state and reviews
-    redacted/...             the same, with emails, tokens, links other than
-                             GitHub's and home-folder names replaced
+    redacted/...             the same, from the redacted export
     stats.json               counts per room, and rule-only candidate counts
     tally.jsonl              one line per run, for how fast each class grows
-    state.json               a cursor per room, so a run reads only what is new
 
-It reads the hub's files, so it runs on the hub's machine. Standard library only.
+It reads the hub over HTTP through the ``mycelium`` CLI, so it runs on any
+machine that can reach the hub. Standard library only, plus the CLI (3.0.43 or newer).
 
-    python3 -m mycelium_classifier.harvest [--data DIR] [--hub URL] [--hub-data DIR]
+    python3 -m mycelium_classifier.harvest [--data DIR] [--hub URL] [--repo OWNER/NAME]
 """
 
 from __future__ import annotations
@@ -25,32 +28,25 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
-import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-BOARD_PREFIXES = ("work/", "decisions/", "status/", "failed/")
 PROSE_TYPES = frozenset({"message", "reply"})
 SYSTEM_TYPES = ("notice", "ping", "extraction")
 C4_WINDOW = timedelta(minutes=30)
-MEMORY_PAGE = 500
-
-MENTION = re.compile(r"(?<![\w`/.])@([!~]?)([A-Za-z0-9][A-Za-z0-9_-]*)")
-MENTION_MODES = {"!": "urgent", "~": "silent"}
-ROLE_KINDS = {"human": "person", "agent": "agent", "coordinator": "engine"}
 
 
 @dataclass
 class Settings:
     data: Path
-    hub: str
-    hub_data: Path
+    hub: str | None
     repo: str
 
 
@@ -58,88 +54,36 @@ def parse_time(stamp: str) -> datetime:
     return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
 
 
-def short_id(urn: str | None) -> str | None:
-    """``urn:ioc:mycelium:episode:<room>:<id>`` → ``<id>``."""
-    return urn.rsplit(":", 1)[-1] if urn else None
+# ── The CLI ─────────────────────────────────────────────────────────────────
 
 
-# ── Reading the hub ─────────────────────────────────────────────────────────
+def mycelium(settings: Settings, *args: str) -> Any:
+    """Run a ``mycelium`` command with ``--json`` and return what it printed."""
+    env = dict(os.environ)
+    if settings.hub:
+        env["MYCELIUM_API_URL"] = settings.hub
+    out = subprocess.run(  # noqa: S603
+        ["mycelium", *args, "--json"],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    if out.returncode != 0:
+        msg = f"mycelium {' '.join(args)} failed: {out.stderr.strip() or out.stdout.strip()}"
+        raise RuntimeError(msg)
+    return json.loads(out.stdout)
 
 
-def api(settings: Settings, path: str, **params: Any) -> Any:
-    query = ("?" + urllib.parse.urlencode(params)) if params else ""
-    with urllib.request.urlopen(f"{settings.hub}/api{path}{query}", timeout=30) as resp:  # noqa: S310
-        return json.load(resp)
+def rooms(settings: Settings) -> list[str]:
+    return [r["name"] for r in mycelium(settings, "room", "ls")]
 
 
-def roster(settings: Settings, room: str) -> dict[str, str]:
-    """Handle → ``person`` or ``agent``. Engines aren't listed; their role places them."""
-    kinds: dict[str, str] = {"system": "system"}
-    for agent in api(settings, f"/rooms/{room}/agents"):
-        if agent.get("handle"):
-            kinds[agent["handle"]] = "agent"
-    users = api(settings, "/users")
-    for user in users.get("users", []) if isinstance(users, dict) else users:
-        if user.get("handle"):
-            kinds[user["handle"]] = "person"
-    return kinds
-
-
-def board(settings: Settings, room: str) -> list[dict[str, Any]]:
-    rows = []
-    for prefix in BOARD_PREFIXES:
-        offset = 0
-        while True:
-            page = api(
-                settings, f"/rooms/{room}/memory", prefix=prefix, limit=MEMORY_PAGE, offset=offset
-            )
-            for mem in page:
-                text = mem.get("content_text") or ""
-                rows.append(
-                    {
-                        "key": mem["key"],
-                        "title": text.split("\n", 1)[0],
-                        "body": text,
-                        "thread": short_id(mem.get("episode")),
-                        "meta": mem.get("meta") or {},
-                        "created_by": mem.get("created_by"),
-                        "updated_by": mem.get("updated_by"),
-                        "version": mem.get("version"),
-                        "created_at": mem.get("created_at"),
-                        "updated_at": mem.get("updated_at"),
-                    }
-                )
-            if len(page) < MEMORY_PAGE:
-                break
-            offset += MEMORY_PAGE
-    return rows
-
-
-def read_transcript(
-    settings: Settings, room: str, cursor: dict[str, Any] | None
-) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
-    """Records after the cursor, the new cursor, and whether the room was read from the start.
-
-    The transcript is append-only, so the cursor is a line count plus the id on
-    that line. If the file got shorter or that line no longer holds that id, the
-    room is read again from the start.
-    """
-    path = settings.hub_data / "rooms" / room / "log" / "transcript.jsonl"
-    if not path.exists():
-        had_lines = cursor is not None and cursor.get("lines", 0) > 0
-        return [], {"lines": 0, "last_id": None}, cursor is None or had_lines
-    with path.open(encoding="utf-8") as fh:
-        lines = [line for line in fh if line.strip()]
-    start = 0
-    if (
-        cursor
-        and 0 < cursor["lines"] <= len(lines)
-        and json.loads(lines[cursor["lines"] - 1]).get("message_id") == cursor["last_id"]
-    ):
-        start = cursor["lines"]
-    records = [json.loads(line) for line in lines[start:]]
-    last_id = json.loads(lines[-1]).get("message_id") if lines else None
-    return records, {"lines": len(lines), "last_id": last_id}, start == 0
+def export(settings: Settings, room: str, out: Path, *, redact: bool) -> dict[str, Any]:
+    args = ["room", "export", room, "--out", str(out)]
+    if redact:
+        args.append("--redact")
+    return mycelium(settings, *args)
 
 
 def prs(settings: Settings) -> list[dict[str, Any]]:
@@ -160,80 +104,30 @@ def prs(settings: Settings) -> list[dict[str, Any]]:
     return json.loads(out.stdout)
 
 
-# ── One transcript record → one line ────────────────────────────────────────
+# ── From an export to the dataset ───────────────────────────────────────────
 
 
-def notice_text(data: dict[str, Any]) -> str:
-    sub = data.get("subkind")
-    title = data.get("title") or data.get("key") or ""
-    if sub == "upstream":
-        head = f"[upstream] {data.get('label') or ''} {data.get('change') or ''}".rstrip()
-        return f"{head}: {title} {data.get('url') or ''}".strip()
-    by = f" by @{data['by']}" if data.get("by") else ""
-    for_ = f" for @{data['for']}" if data.get("for") else ""
-    return f"[{sub}] {title}{by}{for_}"
-
-
-def mentions(text: str) -> list[dict[str, str]]:
-    """Every ``@handle``, with how it was said: plain, silent ``@~`` or urgent ``@!``."""
-    return [
-        {"handle": handle, "mode": MENTION_MODES.get(mode, "plain")}
-        for mode, handle in MENTION.findall(text)
-    ]
-
-
-def normalize(
-    room: str, rec: dict[str, Any], kinds: dict[str, str], task_of: dict[str, str]
-) -> dict[str, Any]:
-    content = rec.get("content") or {}
-    l9 = content.get("l9") or {}
-    header = l9.get("header") or {}
-    message = header.get("message") or {}
-    payload = l9.get("payload") or {}
-    data = dict(payload.get("data") or {})
-    ptype = payload.get("type") or rec.get("kind")
-    sender = rec.get("sender") or ""
-    actors = (header.get("participants") or {}).get("actors") or []
-    role = next((a.get("role") for a in actors if a.get("id") == sender), None)
-    kind = kinds.get(sender) or ROLE_KINDS.get(role or "", "unknown")
-
-    refers_to = None
-    if ptype == "notice":
-        text = notice_text(data)
-        refers_to = short_id(data.get("episode"))
-    elif ptype == "ping":
-        text = f"[ping] @{data.get('sender')} wrote in {short_id(data.get('episode'))}"
-        refers_to = short_id(data.get("episode"))
-    else:
-        text = content.get("content") or ""
-        if ptype == "extraction":
-            data.pop("content", None)
-
-    thread = short_id(message.get("episode"))
-    threaded = thread not in (None, "live", "knowledge")
+def with_room(room: str, record: dict[str, Any]) -> dict[str, Any]:
+    """An export line, with its room and whether it is an agent's message to label."""
     return {
         "room": room,
-        "id": rec.get("message_id"),
-        "at": rec.get("recorded_at"),
-        "sender": sender,
-        "sender_kind": kind,
-        "l9_role": role,
-        "type": ptype,
-        "notice": data.get("subkind") if ptype == "notice" else None,
-        "channel": "thread" if threaded else (thread or "live"),
-        "thread": thread if threaded else None,
-        "task": task_of.get(thread) if threaded and thread else None,
-        "refers_to_thread": refers_to,
-        "refers_to_task": task_of.get(refers_to) if refers_to else None,
-        "parents": message.get("parents") or [],
-        "mentions": mentions(text) if ptype in PROSE_TYPES else [],
-        "text": text,
-        "data": data,
-        "labelable": kind == "agent" and ptype in PROSE_TYPES,
+        **record,
+        "labelable": record.get("sender_kind") == "agent" and record.get("type") in PROSE_TYPES,
     }
 
 
-# ── Redaction ───────────────────────────────────────────────────────────────
+def derive(room: str, export_dir: Path, into: Path) -> list[dict[str, Any]]:
+    """Write ``into/<room>.jsonl`` and ``into/board-<room>.json`` from an export folder."""
+    records = [with_room(room, r) for r in read_jsonl(export_dir / "messages.jsonl")]
+    write_jsonl(into / f"{room}.jsonl", records)
+    board = export_dir / "board.json"
+    if board.exists():
+        into.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(board, into / f"board-{room}.json")
+    return records
+
+
+# ── Redaction, for the PR list (exports redact themselves) ──────────────────
 
 REDACTIONS = [
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<EMAIL>"),
@@ -314,9 +208,9 @@ def candidates(records: list[dict[str, Any]]) -> dict[str, int]:
     return counts
 
 
-def stats(room: str, records: list[dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any]:
+def stats(room: str, records: list[dict[str, Any]], board_rows: int) -> dict[str, Any]:
     if not records:
-        return {"room": room, "records": 0, "board_rows": len(rows)}
+        return {"room": room, "records": 0, "board_rows": board_rows}
     types = Counter(r["type"] for r in records)
     agent_prose = [r for r in records if r["labelable"]]
     system_lines = sum(types[t] for t in SYSTEM_TYPES)
@@ -337,7 +231,7 @@ def stats(room: str, records: list[dict[str, Any]], rows: list[dict[str, Any]]) 
         "threads_with_prose": len(
             {r["thread"] for r in records if r["thread"] and r["type"] in PROSE_TYPES}
         ),
-        "board_rows": len(rows),
+        "board_rows": board_rows,
         "candidates": candidates(records),
     }
 
@@ -367,36 +261,32 @@ def write_json(path: Path, value: Any) -> None:
 # ── A run ───────────────────────────────────────────────────────────────────
 
 
-def harvest_room(
-    settings: Settings, room: str, cursor: dict[str, Any] | None
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Append what's new in one room; its stats and its new cursor."""
+def harvest_room(settings: Settings, room: str) -> dict[str, Any]:
+    """Bring one room's two exports up to date and derive its dataset files."""
     out = settings.data
-    kinds = roster(settings, room)
-    rows = board(settings, room)
-    task_of = {row["thread"]: row["key"] for row in rows if row["thread"]}
-    fresh, new_cursor, from_start = read_transcript(settings, room, cursor)
-    new = sorted((normalize(room, rec, kinds, task_of) for rec in fresh), key=lambda r: r["at"])
-    write_jsonl(out / "raw" / f"{room}.jsonl", new, append=not from_start)
-    write_jsonl(out / "redacted" / f"{room}.jsonl", redact(new), append=not from_start)
-    write_json(out / "raw" / f"board-{room}.json", rows)
-    write_json(out / "redacted" / f"board-{room}.json", redact(rows))
-    room_stats = stats(room, read_jsonl(out / "raw" / f"{room}.jsonl"), rows)
-    room_stats["new_records"] = len(new)
-    room_stats["new_agent_messages"] = sum(r["labelable"] for r in new)
-    print(f"{room}: +{len(new)} ({'from the start' if from_start else 'appended'})")
-    return room_stats, new_cursor
+    plain = export(settings, room, out / "exports" / room, redact=False)
+    export(settings, room, out / "exports-redacted" / room, redact=True)
+    records = derive(room, out / "exports" / room, out / "raw")
+    derive(room, out / "exports-redacted" / room, out / "redacted")
+    room_stats = stats(room, records, int(plain.get("board_rows", 0)))
+    new = int(plain.get("new", 0))
+    room_stats["new_records"] = new
+    room_stats["new_agent_messages"] = sum(r["labelable"] for r in records[len(records) - new :])
+    print(f"{room}: +{new} ({'from the start' if plain.get('from_start') else 'appended'})")
+    return room_stats
 
 
 def run(settings: Settings) -> dict[str, Any]:
     out = settings.data
-    state_path = out / "state.json"
-    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
-    cursors = state.setdefault("cursors", {})
-    all_stats = []
-    for room in [r["name"] for r in api(settings, "/rooms")]:
-        room_stats, cursors[room] = harvest_room(settings, room, cursors.get(room))
-        all_stats.append(room_stats)
+    all_stats, failed = [], {}
+    for room in rooms(settings):
+        try:
+            all_stats.append(harvest_room(settings, room))
+        except RuntimeError as exc:
+            # One room that can't be exported (deleted, or a hub hiccup) shouldn't
+            # stop the rest of a scheduled run.
+            failed[room] = str(exc)
+            print(f"{room}: skipped, {exc}", file=sys.stderr)
     pulls = prs(settings)
     write_json(out / "raw" / "prs.json", pulls)
     write_json(out / "redacted" / "prs.json", redact(pulls))
@@ -406,6 +296,7 @@ def run(settings: Settings) -> dict[str, Any]:
         "at": now,
         "new_records": sum(s.get("new_records", 0) for s in all_stats),
         "rooms": all_stats,
+        "failed": failed,
         "prs": len(pulls),
     }
     write_json(out / "stats.json", summary)
@@ -424,14 +315,12 @@ def run(settings: Settings) -> dict[str, Any]:
         ],
         append=True,
     )
-    state["last_run"] = now
-    write_json(state_path, state)
     return summary
 
 
 def settings_from(argv: list[str] | None = None) -> Settings:
     env = os.environ
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n", 1)[0])
     parser.add_argument(
         "--data",
         default=env.get("MYCELIUM_CLASSIFIER_DATA", Path.home() / "Documents/mycelium-classifier"),
@@ -439,13 +328,8 @@ def settings_from(argv: list[str] | None = None) -> Settings:
     )
     parser.add_argument(
         "--hub",
-        default=env.get("MYCELIUM_API_URL", "http://127.0.0.1:8000"),
-        help="The hub's address (MYCELIUM_API_URL)",
-    )
-    parser.add_argument(
-        "--hub-data",
-        default=env.get("MYCELIUM_DATA_DIR", Path.home() / ".mycelium"),
-        help="The hub's data folder, where each room's transcript is (MYCELIUM_DATA_DIR)",
+        default=None,
+        help="The hub's address, if not the one the mycelium CLI is set up for",
     )
     parser.add_argument(
         "--repo",
@@ -455,8 +339,7 @@ def settings_from(argv: list[str] | None = None) -> Settings:
     args = parser.parse_args(argv)
     return Settings(
         data=Path(args.data).expanduser(),
-        hub=str(args.hub).rstrip("/"),
-        hub_data=Path(args.hub_data).expanduser(),
+        hub=str(args.hub).rstrip("/") if args.hub else None,
         repo=args.repo,
     )
 
