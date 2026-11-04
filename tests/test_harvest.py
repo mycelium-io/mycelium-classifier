@@ -189,6 +189,23 @@ def test_a_room_that_fails_to_export_doesnt_stop_the_others(
     assert (settings.data / "raw" / f"{ROOM}.jsonl").exists()
 
 
+def test_a_failed_pr_fetch_keeps_the_last_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(harvest, "mycelium", FakeCli([_line(0, "builder", "done")]))
+    monkeypatch.setattr(harvest, "prs", lambda _s: [{"number": 7, "title": "x"}])
+    harvest.run(settings)
+    monkeypatch.setattr(harvest, "prs", lambda _s: None)
+
+    summary = harvest.run(settings)
+
+    assert "prs" in summary["failed"]
+    for folder in ("raw", "redacted"):
+        kept = json.loads((settings.data / folder / "prs.json").read_text(encoding="utf-8"))
+        assert [p["number"] for p in kept] == [7]
+
+
 def test_files_are_utf8_whatever_the_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

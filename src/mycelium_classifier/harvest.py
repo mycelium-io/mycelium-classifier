@@ -86,7 +86,8 @@ def export(settings: Settings, room: str, out: Path, *, redact: bool) -> dict[st
     return mycelium(settings, *args)
 
 
-def prs(settings: Settings) -> list[dict[str, Any]]:
+def prs(settings: Settings) -> list[dict[str, Any]] | None:
+    """The repository's pull requests, or None when gh fails."""
     fields = (
         "number,title,state,createdAt,mergedAt,closedAt,reviewDecision,reviews,author,url,"
         "headRefName"
@@ -100,7 +101,7 @@ def prs(settings: Settings) -> list[dict[str, Any]]:
     )
     if out.returncode != 0:
         print(f"  gh: {out.stderr.strip()}", file=sys.stderr)
-        return []
+        return None
     return json.loads(out.stdout)
 
 
@@ -288,8 +289,12 @@ def run(settings: Settings) -> dict[str, Any]:
             failed[room] = str(exc)
             print(f"{room}: skipped, {exc}", file=sys.stderr)
     pulls = prs(settings)
-    write_json(out / "raw" / "prs.json", pulls)
-    write_json(out / "redacted" / "prs.json", redact(pulls))
+    if pulls is None:
+        # A failed fetch keeps the last snapshot rather than writing an empty one.
+        failed["prs"] = "gh pr list failed; kept the previous prs.json"
+    else:
+        write_json(out / "raw" / "prs.json", pulls)
+        write_json(out / "redacted" / "prs.json", redact(pulls))
 
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     summary = {
@@ -297,7 +302,7 @@ def run(settings: Settings) -> dict[str, Any]:
         "new_records": sum(s.get("new_records", 0) for s in all_stats),
         "rooms": all_stats,
         "failed": failed,
-        "prs": len(pulls),
+        "prs": None if pulls is None else len(pulls),
     }
     write_json(out / "stats.json", summary)
     tally: Counter[str] = Counter()
