@@ -144,7 +144,7 @@ def test_a_run_exports_twice_and_writes_raw_redacted_stats_and_a_tally(
         [_line(0, "ada", "@builder hi a@b.co", kind="person"), _line(1, "builder", "done")]
     )
     monkeypatch.setattr(harvest, "mycelium", cli)
-    monkeypatch.setattr(harvest, "prs", lambda _s: [])
+    monkeypatch.setattr(harvest, "prs", lambda *_: [])
 
     first = harvest.run(settings)
     cli.lines.append(_line(2, "builder", "fixed it", thread="t1"))
@@ -180,7 +180,7 @@ def test_a_room_that_fails_to_export_doesnt_stop_the_others(
         return cli(settings, *args)
 
     monkeypatch.setattr(harvest, "mycelium", two_rooms)
-    monkeypatch.setattr(harvest, "prs", lambda _s: [])
+    monkeypatch.setattr(harvest, "prs", lambda *_: [])
 
     summary = harvest.run(settings)
 
@@ -194,9 +194,9 @@ def test_a_failed_pr_fetch_keeps_the_last_snapshot(
 ) -> None:
     settings = _settings(tmp_path)
     monkeypatch.setattr(harvest, "mycelium", FakeCli([_line(0, "builder", "done")]))
-    monkeypatch.setattr(harvest, "prs", lambda _s: [{"number": 7, "title": "x"}])
+    monkeypatch.setattr(harvest, "prs", lambda *_: [{"number": 7, "title": "x"}])
     harvest.run(settings)
-    monkeypatch.setattr(harvest, "prs", lambda _s: None)
+    monkeypatch.setattr(harvest, "prs", lambda *_: None)
 
     summary = harvest.run(settings)
 
@@ -206,6 +206,28 @@ def test_a_failed_pr_fetch_keeps_the_last_snapshot(
         assert [p["number"] for p in kept] == [7]
 
 
+def test_later_runs_fetch_recent_prs_and_merge_them_into_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(harvest, "mycelium", FakeCli([_line(0, "builder", "done")]))
+    limits: list[int] = []
+
+    def fetch(_settings: harvest.Settings, limit: int) -> list[dict[str, Any]]:
+        limits.append(limit)
+        if len(limits) == 1:
+            return [{"number": 8, "state": "OPEN"}, {"number": 7, "state": "OPEN"}]
+        return [{"number": 9, "state": "OPEN"}, {"number": 8, "state": "MERGED"}]
+
+    monkeypatch.setattr(harvest, "prs", fetch)
+    harvest.run(settings)
+    harvest.run(settings)
+
+    assert limits == [harvest.FULL_PRS, harvest.RECENT_PRS]
+    kept = json.loads((settings.data / "raw" / "prs.json").read_text(encoding="utf-8"))
+    assert [(p["number"], p["state"]) for p in kept] == [(9, "OPEN"), (8, "MERGED"), (7, "OPEN")]
+
+
 def test_files_are_utf8_whatever_the_platform(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -213,7 +235,7 @@ def test_files_are_utf8_whatever_the_platform(
     monkeypatch.setattr(
         harvest, "mycelium", FakeCli([_line(0, "builder", "ship it 🚀, Zoë, 東京")])
     )
-    monkeypatch.setattr(harvest, "prs", lambda _s: [])
+    monkeypatch.setattr(harvest, "prs", lambda *_: [])
 
     harvest.run(settings)
 

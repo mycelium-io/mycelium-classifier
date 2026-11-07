@@ -86,13 +86,23 @@ def export(settings: Settings, room: str, out: Path, *, redact: bool) -> dict[st
     return mycelium(settings, *args)
 
 
-def prs(settings: Settings) -> list[dict[str, Any]] | None:
-    """The repository's pull requests, or None when gh fails."""
+# A first run reads the last FULL_PRS pull requests. Later runs read only the
+# RECENT_PRS most recently updated and merge them into the snapshot: one query
+# for 1,000 PRs with their reviews takes minutes and GitHub often resets it.
+FULL_PRS = 1000
+RECENT_PRS = 200
+
+
+def prs(settings: Settings, limit: int = FULL_PRS) -> list[dict[str, Any]] | None:
+    """The repository's most recently updated pull requests, or None when gh fails."""
     fields = (
         "number,title,state,createdAt,mergedAt,closedAt,reviewDecision,reviews,author,url,"
         "headRefName"
     )
-    command = ["gh", "pr", "list", "-R", settings.repo, "--state", "all", "--limit", "1000"]
+    command = [
+        "gh", "pr", "list", "-R", settings.repo, "--state", "all",
+        "--limit", str(limit), "--search", "sort:updated-desc",
+    ]  # fmt: skip
     out = subprocess.run(  # noqa: S603
         [*command, "--json", fields],
         capture_output=True,
@@ -288,11 +298,16 @@ def run(settings: Settings) -> dict[str, Any]:
             # stop the rest of a scheduled run.
             failed[room] = str(exc)
             print(f"{room}: skipped, {exc}", file=sys.stderr)
-    pulls = prs(settings)
+    snapshot = out / "raw" / "prs.json"
+    previous = json.loads(snapshot.read_text(encoding="utf-8")) if snapshot.exists() else []
+    pulls = prs(settings, RECENT_PRS if previous else FULL_PRS)
     if pulls is None:
         # A failed fetch keeps the last snapshot rather than writing an empty one.
         failed["prs"] = "gh pr list failed; kept the previous prs.json"
     else:
+        merged = {p["number"]: p for p in previous}
+        merged.update({p["number"]: p for p in pulls})
+        pulls = sorted(merged.values(), key=lambda p: p["number"], reverse=True)
         write_json(out / "raw" / "prs.json", pulls)
         write_json(out / "redacted" / "prs.json", redact(pulls))
 
